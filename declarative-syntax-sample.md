@@ -377,7 +377,7 @@ pipeline {
         stage("Checkout Code") {
             steps {
                 git branch: 'master',
-                url: "https://github.com/iamvickyav/spring-boot-data-H2-embedded.git"
+                url: "https://github.com/rageshtamizharasu/maven-project"
             }
         }
         stage("Building Application") {
