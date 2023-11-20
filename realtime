@@ -1,0 +1,147 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'VERSION', defaultValue: '1.0.0', description: 'Specify the version for the build')
+        choice(name: 'DEPLOY_TO_PROD', choices: ['true', 'false'], description: 'Deploy to production?')
+    }
+
+    environment {
+        MAVEN_HOME = tool 'Maven'
+        PATH = "$MAVEN_HOME/bin:$PATH"
+    }
+
+    options {
+        timeout(time: 1, unit: 'HOURS') // Set a timeout for the entire pipeline
+        buildDiscarder(logRotator(numToKeepStr: '10')) // Keep only the last 10 builds
+        timestamps() // Add timestamps to console output
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build and Unit Test') {
+            steps {
+                script {
+                    // Build the Java application and run unit tests
+                    def buildStatus = sh script: 'mvn clean install', returnStatus: true
+                    if (buildStatus != 0) {
+                        error 'Build failed! Aborting.'
+                    }
+                }
+            }
+        }
+
+        stage('Integration Test') {
+            steps {
+                // Run integration tests (in parallel with the next stage)
+                parallel(
+                    "Database": {
+                        sh 'mvn verify -Pdatabase-tests'
+                    },
+                    "API": {
+                        sh 'mvn verify -Papi-tests'
+                    }
+                )
+            }
+        }
+
+        stage('Docker Build and Push to ECR') {
+            steps {
+                script {
+                    // Build the Docker image with version tag
+                    sh "docker build -t your-ecr-repository:${params.VERSION} ."
+
+                    // AWS CLI login to ECR
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'your-aws-credentials-id', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh 'aws ecr get-login-password --region your-aws-region | docker login --username AWS --password-stdin your-aws-account-id.dkr.ecr.your-aws-region.amazonaws.com'
+                    }
+
+                    // Push the Docker image to ECR
+                    sh "docker tag your-ecr-repository:${params.VERSION} your-aws-account-id.dkr.ecr.your-aws-region.amazonaws.com/your-ecr-repository:${params.VERSION}"
+                    sh "docker push your-aws-account-id.dkr.ecr.your-aws-region.amazonaws.com/your-ecr-repository:${params.VERSION}"
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                // Only deploy to staging if the build and integration tests are successful
+                expression {
+                    currentBuild.resultIsBetterOrEqualTo('SUCCESS') &&
+                    env.BRANCH_NAME == 'main'
+                }
+            }
+            steps {
+                sh 'ssh user@staging-server "cd /path/to/deployment && ./deploy.sh"'
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                // Only deploy to production if the user approves
+                expression { params.DEPLOY_TO_PROD == 'true' }
+            }
+            steps {
+                input 'Deploy to production?'
+                sh 'ssh user@production-server "cd /path/to/deployment && ./deploy.sh"'
+            }
+        }
+    }
+
+    post {
+        always {
+            // Clean up any resources, notify, or perform other tasks
+
+            // Send build metrics to Prometheus
+            prometheus([
+                jobName: 'jenkins',
+                annotations: [
+                    summary: 'Jenkins build summary',
+                    description: 'Jenkins build metrics sent to Prometheus'
+                ],
+                labels: [
+                    buildStatus: currentBuild.result,
+                    buildNumber: currentBuild.number,
+                    pipelineName: env.JOB_NAME,
+                    pipelineRun: env.BUILD_NUMBER,
+                    pipelineResult: env.BUILD_RESULT
+                ]
+            ])
+        }
+
+        success {
+            // Notify success and ECR push
+            echo "The pipeline ran successfully and pushed version ${params.VERSION} to ECR!"
+            emailext subject: 'Pipeline Successful',
+                      body: "The pipeline ran successfully and pushed version ${params.VERSION} to ECR!",
+                      to: 'your-email@example.com'
+        }
+
+        failure {
+            // Notify failure
+            echo 'The pipeline failed!'
+            emailext subject: 'Pipeline Failed',
+                      body: 'The pipeline failed!',
+                      to: 'your-email@example.com'
+        }
+
+        unstable {
+            // Notify unstable build (optional)
+            echo 'The pipeline is unstable!'
+            emailext subject: 'Pipeline Unstable',
+                      body: 'The pipeline is unstable!',
+                      to: 'your-email@example.com'
+        }
+
+        // Send logs to Splunk on both success and failure
+        splunkLogCollector(url: 'http://your-splunk-collector:8088',
+                           channel: 'jenkins',
+                           sourcetype: 'jenkins_build_logs',
+                           sendResults: true)
+    }
+}
